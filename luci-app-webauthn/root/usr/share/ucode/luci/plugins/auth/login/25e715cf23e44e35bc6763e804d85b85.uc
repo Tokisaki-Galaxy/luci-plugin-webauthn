@@ -5,12 +5,13 @@ Implements challenge generation in check() and assertion verification in verify(
 
 'use strict';
 
-import { popen, access, open, unlink } from 'fs';
+import { popen, access, open, unlink, readfile } from 'fs';
 import { cursor } from 'uci';
 import { syslog, LOG_INFO, LOG_WARNING, LOG_AUTHPRIV } from 'log';
 
 const PLUGIN_UUID = '25e715cf23e44e35bc6763e804d85b85';
 const HELPER_BIN = '/usr/libexec/webauthn-helper';
+const CREDENTIALS_PATH = '/etc/webauthn/credentials.json';
 const CHALLENGE_MAX_AGE = 120;
 const CHALLENGE_PATH_PREFIX = '/tmp/webauthn-auth-';
 const DEFAULT_PRIORITY = 20;
@@ -26,6 +27,28 @@ function helper_available() {
 function plugin_enabled() {
 	let uci = cursor();
 	return uci.get('luci_plugins', PLUGIN_UUID, 'enabled') == '1';
+}
+
+// Passkeys as a second factor after the password are opt-in; the default
+// use is passwordless login through begin()/identify().
+function second_factor_enabled() {
+	let uci = cursor();
+	return uci.get('luci_plugins', PLUGIN_UUID, 'second_factor') == '1';
+}
+
+// Read the store directly: this runs on every login page view, and
+// health-check would spawn the helper and write a probe file each time.
+function any_registered_credentials() {
+	let content = readfile(CREDENTIALS_PATH);
+	let store = null;
+
+	try { store = content ? json(content) : null; } catch (e) {}
+
+	for (let name, user in store?.users)
+		if (length(user?.credentials))
+			return true;
+
+	return false;
 }
 
 function get_priority() {
@@ -172,8 +195,75 @@ function has_registered_credentials(username) {
 return {
 	priority: get_priority(),
 
-	check: function(http, user) {
+	primary: true,
+
+	// Login page affordance for passwordless login. The challenge itself is
+	// fetched when the button is pressed (luci.webauthn login_begin), so
+	// rendering the page creates no state.
+	begin: function(http) {
+		if (!plugin_enabled() || !helper_available() || !any_registered_credentials())
+			return { available: false };
+
+		return {
+			available: true,
+			html: '<div id="webauthn-primary-login">'
+				+ '<input type="hidden" name="webauthn_login_response" value="">'
+				+ '<div id="webauthn-primary-status" style="display:none" class="alert-message"></div>'
+				+ '<input type="button" id="webauthn-primary-btn" class="btn cbi-button" '
+				+ 'style="width:100%;margin-top:0.5em" value="&#x1F511; Sign in with passkey">'
+				+ '</div>',
+			assets: [
+				`/luci-static/plugins/${PLUGIN_UUID}/login.js`
+			]
+		};
+	},
+
+	// Verify a passwordless login. Returns null when the request carries no
+	// passkey response, so the password path handles it.
+	identify: function(http) {
+		let response_json = http.formvalue('webauthn_login_response');
+
+		if (!response_json)
+			return null;
+
 		if (!plugin_enabled() || !helper_available())
+			return { authenticated: false, message: 'Passkey login is not available' };
+
+		let payload = null;
+		try { payload = json(response_json); } catch (e) {}
+
+		let challenge_id = payload?.challengeId;
+		let cred = payload?.credential;
+
+		if (type(challenge_id) != 'string' ||
+		    !match(challenge_id, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/) ||
+		    !(cred?.id && cred?.type && cred?.response?.userHandle))
+			return { authenticated: false, message: 'Passkey response format is invalid' };
+
+		let origin = get_origin(http);
+		let cmd = sprintf('%s login-finish --challenge-id %s --origin %s',
+			HELPER_BIN, esc(challenge_id), esc(origin));
+		let data = unwrap(exec_helper(cmd, sprintf('%J', {
+			id: cred.id,
+			rawId: cred.id,
+			type: cred.type,
+			response: cred.response,
+			authenticatorAttachment: cred.authenticatorAttachment,
+			clientExtensionResults: cred.clientExtensionResults ?? {}
+		})));
+
+		if (data?.error || type(data?.username) != 'string') {
+			syslog(LOG_WARNING|LOG_AUTHPRIV,
+				sprintf("luci: webauthn passwordless login failed from %s: %s",
+					http.getenv('REMOTE_ADDR') || '?', data?.message || data?.error || 'no username'));
+			return { authenticated: false, message: 'Passkey verification failed' };
+		}
+
+		return { authenticated: true, username: data.username };
+	},
+
+	check: function(http, user) {
+		if (!plugin_enabled() || !second_factor_enabled() || !helper_available())
 			return { required: false };
 
 		if (!has_registered_credentials(user))

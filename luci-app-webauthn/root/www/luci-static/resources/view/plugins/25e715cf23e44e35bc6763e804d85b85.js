@@ -12,13 +12,25 @@ return baseclass.extend({
 	name: 'WebAuthn Passkey',
 	id: '25e715cf23e44e35bc6763e804d85b85',
 	title: _('WebAuthn Passkey Authentication'),
-	description: _('Adds passkey verification as an additional authentication factor for LuCI login. ' +
-	               'Use the WebAuthn management RPC APIs to register and manage credentials.'),
+	description: _('Sign in to LuCI with a passkey instead of a password, or require one after the password. ' +
+	               'Register passkeys under System > Administration > Passkeys.'),
 
 	addFormOptions: function(s) {
 		var o;
 
 		o = s.option(form.Flag, 'enabled', _('Enabled'));
+		o.default = o.disabled;
+		o.rmempty = false;
+
+		o = s.option(form.Flag, 'primary', _('Passwordless login'),
+			_('Offer "Sign in with passkey" on the login page. The password login stays available.'));
+		o.depends('enabled', '1');
+		o.default = o.enabled;
+		o.rmempty = false;
+
+		o = s.option(form.Flag, 'second_factor', _('Require after password'),
+			_('Ask for a passkey after a correct password.'));
+		o.depends('enabled', '1');
 		o.default = o.disabled;
 		o.rmempty = false;
 
@@ -40,8 +52,14 @@ return baseclass.extend({
 		if (section.enabled != '1')
 			return null;
 
-		return section.origin
-			? _('enabled, custom origin: %s').format(section.origin)
-			: _('enabled');
+		var modes = [];
+		if (section.primary != '0')
+			modes.push(_('passwordless'));
+		if (section.second_factor == '1')
+			modes.push(_('second factor'));
+
+		return (section.origin
+			? _('enabled (%s), custom origin: %s').format(modes.join(', '), section.origin)
+			: _('enabled (%s)').format(modes.join(', ')));
 	}
 });

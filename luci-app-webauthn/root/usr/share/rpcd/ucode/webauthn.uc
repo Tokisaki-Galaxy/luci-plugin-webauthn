@@ -18,6 +18,10 @@ const PLUGIN_UUID = '25e715cf23e44e35bc6763e804d85b85';
 const CHALLENGE_PATH_PREFIX = '/tmp/webauthn-auth-';
 const CHALLENGE_MAX_AGE = 120;
 
+function configured_origin() {
+	return cursor().get('luci_plugins', PLUGIN_UUID, 'origin');
+}
+
 function plugin_origin() {
 	const uci = cursor();
 	let origin = uci.get('luci_plugins', PLUGIN_UUID, 'origin');
@@ -130,13 +134,42 @@ const methods = {
 		}
 	},
 
+	// Called before login (granted to the unauthenticated group): start a
+	// passwordless login. The RP ID is the configured origin's host, or
+	// else the hostname the browser is on; the browser only lets a page use
+	// an RP ID its own origin is under, and login-finish checks the
+	// request's origin against it.
+	login_begin: {
+		args: { rpId: 'rpId' },
+		call: function(request) {
+			const uci = cursor();
+
+			if (uci.get('luci_plugins', PLUGIN_UUID, 'enabled') != '1')
+				return { error: 'DISABLED', message: 'Passkey login is disabled' };
+
+			let configured = uci.get('luci_plugins', PLUGIN_UUID, 'origin');
+			let rp_id = configured ? get_rp_id(configured) : request.args.rpId;
+
+			if (type(rp_id) != 'string' || !match(rp_id, /^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$/))
+				return { error: 'INVALID_INPUT', message: 'Invalid RP ID' };
+
+			let cmd = sprintf('%s login-begin --rp-id %s', HELPER_BIN, esc(rp_id));
+			let data = unwrap(exec_helper(cmd));
+
+			if (data?.error)
+				return { error: data.error, message: 'Passkey login unavailable' };
+
+			return { challengeId: data.challengeId, publicKey: data.publicKey };
+		}
+	},
+
 	register_begin: {
 		args: { username: 'username', userVerification: 'userVerification', origin: 'origin' },
 		call: function(request) {
-			let origin = request.args.origin || plugin_origin();
+			let origin = configured_origin() || request.args.origin || plugin_origin();
 			let rp_id = get_rp_id(origin);
 			let username = request.args.username || 'root';
-			let uv = request.args.userVerification || 'preferred';
+			let uv = request.args.userVerification || 'required';
 
 			let cmd = sprintf('%s register-begin --username %s --rp-id %s --user-verification %s',
 				HELPER_BIN, esc(username), esc(rp_id), esc(uv));
@@ -155,7 +188,7 @@ const methods = {
 			origin: 'origin'
 		},
 		call: function(request) {
-			let origin = request.args.origin || plugin_origin();
+			let origin = configured_origin() || request.args.origin || plugin_origin();
 			let a = request.args;
 
 			let cmd = sprintf('%s register-finish --challenge-id %s --origin %s --device-name %s',

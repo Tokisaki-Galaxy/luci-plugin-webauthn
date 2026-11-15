@@ -215,7 +215,7 @@ return view.extend({
 			'My Device');
 		if (deviceName === null) return;
 
-		return callRegisterBegin('root', 'preferred', window.location.origin)
+		return callRegisterBegin('root', 'required', window.location.origin)
 			.then(function(data) {
 				if (data.error) throw data;
 
