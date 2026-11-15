@@ -1,6 +1,10 @@
 'use strict';
 'require baseclass';
 'require form';
+'require webauthn.settings as settings';
+
+// This plugin's entry on System > Plugins. System > Administration > Passkeys
+// edits the same settings and is where passkeys are registered.
 
 return baseclass.extend({
 	class: 'auth',
@@ -11,37 +15,22 @@ return baseclass.extend({
 
 	name: 'WebAuthn Passkey',
 	id: '25e715cf23e44e35bc6763e804d85b85',
-	title: _('WebAuthn Passkey Authentication'),
-	description: _('Adds passkey verification as an additional authentication factor for LuCI login. ' +
-	               'Use the WebAuthn management RPC APIs to register and manage credentials.'),
+	title: _('Passkeys'),
+	description: _('Sign in with a passkey instead of the password, or ask for one as a second factor. ' +
+	               'Register passkeys under System > Administration > Passkeys.'),
 
 	addFormOptions: function(s) {
-		var o;
-
-		o = s.option(form.Flag, 'enabled', _('Enabled'));
+		var o = s.option(form.Flag, 'enabled', _('Enabled'));
 		o.default = o.disabled;
 		o.rmempty = false;
 
-		o = s.option(form.Value, 'priority', _('Priority'),
-			_('Execution order for this plugin. Lower values run earlier.'));
+		o = settings.addModeOption(s, false);
 		o.depends('enabled', '1');
-		o.datatype = 'integer';
-		o.placeholder = '20';
-		o.rmempty = true;
 
-		o = s.option(form.Value, 'origin', _('Origin (optional override)'),
-			_('Optional origin override for WebAuthn verification, e.g. https://router.example.com'));
-		o.depends('enabled', '1');
-		o.placeholder = 'https://openwrt.local';
-		o.rmempty = true;
+		settings.addAdvancedOptions(s);
 	},
 
 	configSummary: function(section) {
-		if (section.enabled != '1')
-			return null;
-
-		return section.origin
-			? _('enabled, custom origin: %s').format(section.origin)
-			: _('enabled');
+		return settings.summary(section);
 	}
 });

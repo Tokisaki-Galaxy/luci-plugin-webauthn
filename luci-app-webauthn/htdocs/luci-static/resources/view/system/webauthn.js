@@ -3,6 +3,9 @@
 'require dom';
 'require rpc';
 'require ui';
+'require uci';
+'require form';
+'require webauthn.settings as settings';
 
 var utils = {
 	decode: function(str) {
@@ -101,7 +104,8 @@ return view.extend({
 	load: function() {
 		return Promise.all([
 			callHealth().catch(function() { return {}; }),
-			callManageList().catch(function() { return { credentials: [] }; })
+			callManageList().catch(function() { return { credentials: [] }; }),
+			uci.load('luci_plugins')
 		]);
 	},
 
@@ -113,14 +117,13 @@ return view.extend({
 				E('th', { 'class': 'th' }, _('Device Name')),
 				E('th', { 'class': 'th' }, _('Registered')),
 				E('th', { 'class': 'th' }, _('Last Used')),
-				E('th', { 'class': 'th' }, _('Verified')),
 				E('th', { 'class': 'th' }, _('Actions'))
 			])
 		]);
 
 		if (!credentials || credentials.length === 0) {
 			table.appendChild(E('tr', { 'class': 'tr placeholder' }, [
-				E('td', { 'class': 'td', 'colspan': '5' },
+				E('td', { 'class': 'td', 'colspan': '4' },
 					_('No passkeys registered. Click "Register New Passkey" to add one.'))
 			]));
 			return table;
@@ -166,15 +169,10 @@ return view.extend({
 				}
 			}, _('Delete'));
 
-			var verifiedIcon = cred.userVerified
-				? E('span', { 'style': 'color:green' }, '\u2714')
-				: E('span', { 'style': 'color:gray' }, '\u2718');
-
 			table.appendChild(E('tr', { 'class': 'tr' }, [
 				E('td', { 'class': 'td' }, [ nameInput ]),
 				E('td', { 'class': 'td' }, formatDate(cred.createdAt)),
 				E('td', { 'class': 'td' }, formatRelativeTime(cred.lastUsedAt)),
-				E('td', { 'class': 'td' }, [ verifiedIcon ]),
 				E('td', { 'class': 'td' }, [ deleteBtn ])
 			]));
 		});
@@ -211,13 +209,46 @@ return view.extend({
 			return;
 		}
 
-		var deviceName = prompt(_('Enter a name for this passkey (e.g. "My Laptop"):'),
-			'My Device');
-		if (deviceName === null) return;
+		// Safari only lets credentials.create() run inside the click that
+		// asked for it, and a prompt or server round trip in between uses
+		// that up. So the options are fetched while the dialog is open and
+		// the Register button calls create() straight away.
+		var pending = null;	// { opts, challengeId } from register_begin
+		var refreshTimer = null;
+		var closed = false;
 
-		return callRegisterBegin('root', 'preferred', window.location.origin)
-			.then(function(data) {
+		var nameInput = E('input', {
+			'type': 'text',
+			'class': 'cbi-input-text',
+			'value': _('My Device'),
+			'maxlength': 64
+		});
+		var statusEl = E('p', { 'class': 'spinning' }, _('Preparing…'));
+		var registerBtn = E('button', {
+			'class': 'btn cbi-button cbi-button-positive',
+			'disabled': true
+		}, _('Register'));
+
+		var close = function() {
+			closed = true;
+			clearTimeout(refreshTimer);
+			ui.hideModal();
+		};
+
+		var showStatus = function(msg, isError) {
+			statusEl.className = isError ? 'alert-message error' : '';
+			statusEl.textContent = msg;
+		};
+
+		// The server drops registration challenges after five minutes.
+		var prepare = function() {
+			clearTimeout(refreshTimer);
+			pending = null;
+			registerBtn.disabled = true;
+
+			return callRegisterBegin('root', 'required', window.location.origin).then(function(data) {
 				if (data.error) throw data;
+				if (closed) return;
 
 				var opts = data.publicKey || data;
 				if (opts.challenge)
@@ -230,14 +261,31 @@ return view.extend({
 					});
 				}
 
-				return navigator.credentials.create({ publicKey: opts }).then(function(cred) {
-					return { cred: cred, challengeId: data.challengeId };
-				});
-			})
-			.then(function(result) {
-				var cred = result.cred;
+				pending = { opts: opts, challengeId: data.challengeId };
+				refreshTimer = setTimeout(prepare, 4 * 60 * 1000);
+				registerBtn.disabled = false;
+				showStatus(_('Your browser will ask you to create a passkey.'), false);
+			}).catch(function(err) {
+				if (!closed)
+					showStatus(friendlyError(err), true);
+			});
+		};
+
+		var register = function() {
+			if (!pending)
+				return;
+
+			var deviceName = nameInput.value.trim() || _('My Device');
+			var challengeId = pending.challengeId;
+
+			registerBtn.disabled = true;
+			clearTimeout(refreshTimer);
+			showStatus(_('Waiting for passkey…'), false);
+
+			// Called synchronously from the click handler; see above.
+			navigator.credentials.create({ publicKey: pending.opts }).then(function(cred) {
 				return callRegisterFinish(
-					result.challengeId,
+					challengeId,
 					deviceName,
 					cred.id,
 					cred.type,
@@ -247,15 +295,43 @@ return view.extend({
 					},
 					window.location.origin
 				);
-			})
-			.then(function(data) {
+			}).then(function(data) {
 				if (data.error) throw data;
+				close();
 				ui.addNotification(null, E('p', _('Passkey registered successfully!')), 'info');
 				return self.refreshTable();
-			})
-			.catch(function(err) {
-				ui.addNotification(null, E('p', friendlyError(err)), 'error');
+			}).catch(function(err) {
+				if (closed) return;
+				var msg = (err && err.name === 'NotAllowedError')
+					? _('The browser did not create a passkey: the request was cancelled, timed out, or was blocked.')
+					: friendlyError(err);
+				// The challenge may be spent; get a new one for another try.
+				prepare().then(function() { if (!closed) showStatus(msg, true); });
 			});
+		};
+
+		registerBtn.addEventListener('click', register);
+		nameInput.addEventListener('keydown', function(ev) {
+			if (ev.key === 'Enter')
+				register();
+		});
+
+		ui.showModal(_('Register New Passkey'), [
+			E('div', { 'class': 'cbi-value' }, [
+				E('label', { 'class': 'cbi-value-title' }, _('Name')),
+				E('div', { 'class': 'cbi-value-field' }, [ nameInput ])
+			]),
+			statusEl,
+			E('div', { 'class': 'right' }, [
+				E('button', { 'class': 'btn cbi-button', 'click': close }, _('Cancel')),
+				' ',
+				registerBtn
+			])
+		]);
+
+		nameInput.focus();
+		nameInput.select();
+		prepare();
 	},
 
 	render: function(data) {
@@ -264,43 +340,63 @@ return view.extend({
 		var manageData = data[1] || {};
 		var credentials = manageData.credentials || [];
 
-		var children = [
-			E('h2', _('Passkey Management')),
-			E('div', { 'class': 'cbi-map-descr' },
-				_('Manage WebAuthn passkeys for passwordless login to this router.'))
-		];
+		var m = new form.Map('luci_plugins', _('Passkeys'),
+			_('Sign in to this router with a passkey stored on your phone, computer or security key.'));
 
-		if (!window.isSecureContext) {
-			children.push(E('div', { 'class': 'alert-message warning' },
-				_('Passkeys require HTTPS. Please configure SSL/TLS on this router.')));
-		} else if (health.error) {
-			children.push(E('div', { 'class': 'alert-message warning' },
-				_('WebAuthn service is not available: %s').format(
-					health.message || health.error)));
-		} else if (!window.PublicKeyCredential) {
-			children.push(E('div', { 'class': 'alert-message warning' },
-				_('Your browser does not support passkeys (WebAuthn).')));
-		}
+		var s = m.section(form.NamedSection, settings.uuid, 'auth_login', _('Sign-in'));
+		s.anonymous = false;
+		settings.addModeOption(s, true);
+		settings.addOriginOption(s);
+
+		var warnings = [];
+
+		var warn = function(msg) {
+			warnings.push(E('div', { 'class': 'alert-message warning' }, msg));
+		};
+		var here = window.location.origin.toLowerCase();
+		var origin = settings.origin();
+		var host = window.location.hostname;
+		var byIP = /^[0-9.]+$/.test(host) || host.indexOf(':') >= 0 || host.charAt(0) == '[';
+		var elsewhere = !!origin && origin != here;
+
+		if (!window.isSecureContext)
+			warn(_('Passkeys require HTTPS. Please configure SSL/TLS on this router.'));
+		else if (byIP)
+			warn(_('This page was opened by IP address. Passkeys belong to a name, so open the router by its name (such as https://router.example.com) to use them.'));
+		else if (elsewhere)
+			warn(E([], [
+				_('Passkeys on this router work at %s, but this page was opened at %s. Registering or signing in with a passkey only works at ').format(origin, here),
+				E('a', { 'href': origin + window.location.pathname }, origin),
+				_('. To use a different address, change Origin below; passkeys registered for the old one stop working.')
+			]));
+
+		if (health.certSelfSigned === true)
+			warn(_('This router uses a self-signed certificate, as OpenWrt does out of the box. Browsers refuse passkeys on sites whose certificate they don\'t trust, so install a trusted one first, e.g. with acme.sh / luci-app-acme.'));
+
+		if (health.error)
+			warn(_('WebAuthn service is not available: %s').format(health.message || health.error));
+		else if (window.isSecureContext && !window.PublicKeyCredential)
+			warn(_('Your browser does not support passkeys (WebAuthn).'));
 
 		var registerBtn = E('button', {
 			'class': 'btn cbi-button cbi-button-positive',
 			'click': function() { self.handleRegister(); },
-			'disabled': (!window.isSecureContext || !!health.error || !window.PublicKeyCredential) || null
-		}, [ '\u{1F511} ', _('Register New Passkey') ]);
+			'disabled': (!window.isSecureContext || !!health.error || !window.PublicKeyCredential || byIP || elsewhere) || null
+		}, _('Register New Passkey'));
 
-		children.push(E('div', { 'class': 'cbi-section' }, [
+		var keys = E('div', { 'class': 'cbi-section' }, [
+			E('h3', {}, _('Registered passkeys')),
 			E('div', { 'id': 'webauthn-table-container' }, [
 				this.renderCredentialTable(credentials)
 			]),
-			E('div', { 'class': 'cbi-page-actions', 'style': 'margin-top:1em' }, [
-				registerBtn
-			])
-		]));
+			E('div', { 'class': 'right', 'style': 'margin-top:1em' }, [ registerBtn ])
+		]);
 
-		return E('div', { 'class': 'cbi-map' }, children);
-	},
-
-	handleSave: null,
-	handleSaveApply: null,
-	handleReset: null
+		return m.render().then(function(node) {
+			var descr = node.querySelector('.cbi-map-descr');
+			warnings.forEach(function(w) { descr.parentNode.insertBefore(w, descr.nextSibling); });
+			node.appendChild(keys);
+			return node;
+		});
+	}
 });
