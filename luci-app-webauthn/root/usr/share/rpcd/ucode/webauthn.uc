@@ -104,6 +104,78 @@ function unwrap(result) {
 	return result;
 }
 
+// Reads one DER item (tag, length, contents) at off.
+function der_item(der, off) {
+	let tag = ord(der, off), len = ord(der, off + 1), hdr = 2;
+
+	if (tag == null || len == null)
+		return null;
+
+	if (len & 0x80) {
+		let n = len & 0x7f;
+
+		if (n < 1 || n > 3)
+			return null;
+
+		len = 0;
+		for (let i = 0; i < n; i++)
+			len = len * 256 + ord(der, off + 2 + i);
+		hdr += n;
+	}
+
+	return { tag: tag, start: off, body: off + hdr, end: off + hdr + len };
+}
+
+// Whether the certificate uhttpd serves is self-signed (its issuer is its
+// subject), as the one a stock install generates is. Browsers refuse
+// passkeys on a page whose certificate they don't trust. null when the
+// certificate can't be read.
+function cert_self_signed() {
+	let path = cursor().get('uhttpd', 'main', 'cert');
+	let fd = path ? open(path, 'r') : null;
+
+	if (!fd)
+		return null;
+
+	let pem = fd.read('all');
+	fd.close();
+
+	// The first certificate in the file is the server's own.
+	const BEGIN = '-----BEGIN CERTIFICATE-----';
+	let from = index(pem ?? '', BEGIN);
+	let to = (from >= 0) ? index(substr(pem, from), '-----END CERTIFICATE-----') : -1;
+	let der = (to > 0) ? b64dec(replace(substr(pem, from + length(BEGIN), to - length(BEGIN)), /[ \t\r\n]+/g, '')) : null;
+	let cert = der ? der_item(der, 0) : null;
+	let tbs = cert ? der_item(der, cert.body) : null;
+
+	if (!tbs)
+		return null;
+
+	// TBSCertificate: [0] version (optional), serial, signature algorithm,
+	// issuer, validity, subject, ...
+	let fields = [];
+	for (let off = tbs.body; off < tbs.end && length(fields) < 6; ) {
+		let item = der_item(der, off);
+
+		if (!item)
+			return null;
+
+		if (!length(fields) && item.tag != 0xa0)
+			push(fields, null);
+
+		push(fields, item);
+		off = item.end;
+	}
+
+	let issuer = fields[3], subject = fields[5];
+
+	if (!issuer || !subject)
+		return null;
+
+	return substr(der, issuer.start, issuer.end - issuer.start) ==
+		substr(der, subject.start, subject.end - subject.start);
+}
+
 function read_challenge_state(token) {
 	if (!match(token, /^[0-9a-f]{32}$/))
 		return null;
@@ -130,7 +202,12 @@ const methods = {
 	health: {
 		call: function() {
 			let cmd = sprintf('%s health-check', HELPER_BIN);
-			return unwrap(exec_helper(cmd));
+			let result = unwrap(exec_helper(cmd));
+
+			if (type(result) == 'object')
+				result.certSelfSigned = cert_self_signed();
+
+			return result;
 		}
 	},
 
@@ -200,7 +277,19 @@ const methods = {
 				id: a.id, rawId: a.id, type: a.type, response: a.response
 			});
 
-			return unwrap(exec_helper(cmd, stdin_data));
+			let result = unwrap(exec_helper(cmd, stdin_data));
+
+			// Passkeys only ever work at the address they were registered
+			// at. Without a configured origin, keep that one, so the login
+			// page and the Passkeys tab know where passkeys work.
+			if (type(result) == 'object' && !result.error && !configured_origin()) {
+				const uci = cursor();
+				uci.set('luci_plugins', PLUGIN_UUID, 'origin', origin);
+				uci.set('luci_plugins', PLUGIN_UUID, 'origin_auto', '1');
+				uci.commit('luci_plugins');
+			}
+
+			return result;
 		}
 	},
 
@@ -245,8 +334,23 @@ const methods = {
 		call: function(request) {
 			let cmd = sprintf('%s credential-manage delete --id %s',
 				HELPER_BIN, esc(request.args.id));
+			let result = unwrap(exec_helper(cmd));
 
-			return unwrap(exec_helper(cmd));
+			// With the last passkey gone, forget an origin that the first
+			// registration set, so the next one can be made elsewhere.
+			const uci = cursor();
+			if (type(result) == 'object' && !result.error &&
+			    uci.get('luci_plugins', PLUGIN_UUID, 'origin_auto') == '1') {
+				let left = unwrap(exec_helper(sprintf('%s credential-manage list --username %s', HELPER_BIN, esc('root'))));
+
+				if (type(left) == 'array' && !length(left)) {
+					uci.delete('luci_plugins', PLUGIN_UUID, 'origin');
+					uci.delete('luci_plugins', PLUGIN_UUID, 'origin_auto');
+					uci.commit('luci_plugins');
+				}
+			}
+
+			return result;
 		}
 	},
 

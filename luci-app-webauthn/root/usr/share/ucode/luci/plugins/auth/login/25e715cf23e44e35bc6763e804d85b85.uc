@@ -73,6 +73,39 @@ function get_origin(http) {
 	return `${scheme}://${host}`;
 }
 
+// Why passkeys can't work for this request, or null when they can: they
+// need HTTPS, a host name rather than an IP address, and the configured
+// origin when there is one.
+function origin_problem(http) {
+	let host = http.getenv('HTTP_HOST') || '';
+
+	if (http.getenv('HTTPS') != 'on')
+		return 'the page was not loaded over HTTPS';
+
+	if (match(host, /^[0-9.]+(:[0-9]+)?$/) || index(host, '[') == 0)
+		return 'the page was opened by IP address; passkeys need a host name';
+
+	let cfg = cursor().get('luci_plugins', PLUGIN_UUID, 'origin');
+	if (!cfg)
+		return null;
+
+	let norm = (o) => replace(lc(rtrim(o, '/')), /:443$/, '');
+	if (norm(cfg) != norm('https://' + host))
+		return sprintf('passkeys on this router work at %s; open the router there', cfg);
+
+	return null;
+}
+
+// In place of the button, tell the browser console why it isn't there.
+function explain_hidden(reason) {
+	let msg = sprintf('%J', 'LuCI: "Sign in with passkey" is hidden because ' + reason + '.');
+
+	return {
+		available: true,
+		html: '<script>console.info(' + replace(msg, '</', '<\\/') + ');</script>'
+	};
+}
+
 function get_rp_id(origin) {
 	let rest = replace(origin, /^https?:\/\//, '');
 	let host = split(rest, '/')[0];
@@ -201,8 +234,20 @@ return {
 	// fetched when the button is pressed (luci.webauthn login_begin), so
 	// rendering the page creates no state.
 	begin: function(http) {
-		if (!plugin_enabled() || !helper_available() || !any_registered_credentials())
+		if (!plugin_enabled())
 			return { available: false };
+
+		if (!helper_available())
+			return explain_hidden('webauthn-helper is not installed');
+
+		if (!any_registered_credentials())
+			return explain_hidden('no passkey is registered yet (System > Administration > Passkeys)');
+
+		// Passkeys only work over HTTPS at the address they belong to, so
+		// don't offer a button that can only fail.
+		let problem = origin_problem(http);
+		if (problem)
+			return explain_hidden(problem);
 
 		return {
 			available: true,

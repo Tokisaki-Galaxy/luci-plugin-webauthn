@@ -346,25 +346,42 @@ return view.extend({
 		var s = m.section(form.NamedSection, settings.uuid, 'auth_login', _('Sign-in'));
 		s.anonymous = false;
 		settings.addModeOption(s, true);
+		settings.addOriginOption(s);
 
 		var warnings = [];
 
-		if (!window.isSecureContext) {
-			warnings.push(E('div', { 'class': 'alert-message warning' },
-				_('Passkeys require HTTPS. Please configure SSL/TLS on this router.')));
-		} else if (health.error) {
-			warnings.push(E('div', { 'class': 'alert-message warning' },
-				_('WebAuthn service is not available: %s').format(
-					health.message || health.error)));
-		} else if (!window.PublicKeyCredential) {
-			warnings.push(E('div', { 'class': 'alert-message warning' },
-				_('Your browser does not support passkeys (WebAuthn).')));
-		}
+		var warn = function(msg) {
+			warnings.push(E('div', { 'class': 'alert-message warning' }, msg));
+		};
+		var here = window.location.origin.toLowerCase();
+		var origin = settings.origin();
+		var host = window.location.hostname;
+		var byIP = /^[0-9.]+$/.test(host) || host.indexOf(':') >= 0 || host.charAt(0) == '[';
+		var elsewhere = !!origin && origin != here;
+
+		if (!window.isSecureContext)
+			warn(_('Passkeys require HTTPS. Please configure SSL/TLS on this router.'));
+		else if (byIP)
+			warn(_('This page was opened by IP address. Passkeys belong to a name, so open the router by its name (such as https://router.example.com) to use them.'));
+		else if (elsewhere)
+			warn(E([], [
+				_('Passkeys on this router work at %s, but this page was opened at %s. Registering or signing in with a passkey only works at ').format(origin, here),
+				E('a', { 'href': origin + window.location.pathname }, origin),
+				_('. To use a different address, change Origin below; passkeys registered for the old one stop working.')
+			]));
+
+		if (health.certSelfSigned === true)
+			warn(_('This router uses a self-signed certificate, as OpenWrt does out of the box. Browsers refuse passkeys on sites whose certificate they don\'t trust, so install a trusted one first, e.g. with acme.sh / luci-app-acme.'));
+
+		if (health.error)
+			warn(_('WebAuthn service is not available: %s').format(health.message || health.error));
+		else if (window.isSecureContext && !window.PublicKeyCredential)
+			warn(_('Your browser does not support passkeys (WebAuthn).'));
 
 		var registerBtn = E('button', {
 			'class': 'btn cbi-button cbi-button-positive',
 			'click': function() { self.handleRegister(); },
-			'disabled': (!window.isSecureContext || !!health.error || !window.PublicKeyCredential) || null
+			'disabled': (!window.isSecureContext || !!health.error || !window.PublicKeyCredential || byIP || elsewhere) || null
 		}, _('Register New Passkey'));
 
 		var keys = E('div', { 'class': 'cbi-section' }, [

@@ -68,14 +68,46 @@ return baseclass.extend({
 		return o;
 	},
 
-	addAdvancedOptions: function(s) {
+	// Passkeys belong to one address. The first registration fills this in
+	// when it's empty (marking it origin_auto, so deleting the last passkey
+	// clears it again); setting it here makes it stick.
+	addOriginOption: function(s) {
 		var o = s.option(form.Value, 'origin', _('Origin'),
-			_('The address passkeys are registered for, such as https://router.example.com. ' +
-			  'Leave empty to use the address the page was opened with.'));
-		o.placeholder = 'https://openwrt.lan';
+			_('The address passkeys work at, such as https://router.example.com. ' +
+			  'Registering the first passkey fills it in.'));
+		o.placeholder = window.location.origin;
+		o.datatype = 'string';
 		o.rmempty = true;
 
-		o = s.option(form.Value, 'priority', _('Priority'),
+		o.validate = function(section_id, value) {
+			if (value && !/^https:\/\/[^/?#\s]+$/.test(value))
+				return _('Expecting an address like https://router.example.com');
+			return true;
+		};
+
+		o.write = function(section_id, value) {
+			set(section_id, 'origin', value.replace(/\/+$/, ''));
+			uci.unset('luci_plugins', section_id, 'origin_auto');
+		};
+
+		o.remove = function(section_id) {
+			uci.unset('luci_plugins', section_id, 'origin');
+			uci.unset('luci_plugins', section_id, 'origin_auto');
+		};
+
+		return o;
+	},
+
+	// The origin the passkeys belong to, if known.
+	origin: function() {
+		var o = get(PLUGIN_UUID, 'origin');
+		return o ? o.replace(/\/+$/, '').replace(/:443$/, '').toLowerCase() : null;
+	},
+
+	addAdvancedOptions: function(s) {
+		this.addOriginOption(s);
+
+		var o = s.option(form.Value, 'priority', _('Priority'),
 			_('Order among login plugins. Lower values run earlier.'));
 		o.datatype = 'integer';
 		o.placeholder = '20';
