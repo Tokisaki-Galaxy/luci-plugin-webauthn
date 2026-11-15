@@ -211,13 +211,46 @@ return view.extend({
 			return;
 		}
 
-		var deviceName = prompt(_('Enter a name for this passkey (e.g. "My Laptop"):'),
-			'My Device');
-		if (deviceName === null) return;
+		// Safari only lets credentials.create() run inside the click that
+		// asked for it, and a prompt or server round trip in between uses
+		// that up. So the options are fetched while the dialog is open and
+		// the Register button calls create() straight away.
+		var pending = null;	// { opts, challengeId } from register_begin
+		var refreshTimer = null;
+		var closed = false;
 
-		return callRegisterBegin('root', 'required', window.location.origin)
-			.then(function(data) {
+		var nameInput = E('input', {
+			'type': 'text',
+			'class': 'cbi-input-text',
+			'value': _('My Device'),
+			'maxlength': 64
+		});
+		var statusEl = E('p', { 'class': 'spinning' }, _('Preparing…'));
+		var registerBtn = E('button', {
+			'class': 'btn cbi-button cbi-button-positive',
+			'disabled': true
+		}, _('Register'));
+
+		var close = function() {
+			closed = true;
+			clearTimeout(refreshTimer);
+			ui.hideModal();
+		};
+
+		var showStatus = function(msg, isError) {
+			statusEl.className = isError ? 'alert-message error' : '';
+			statusEl.textContent = msg;
+		};
+
+		// The server drops registration challenges after five minutes.
+		var prepare = function() {
+			clearTimeout(refreshTimer);
+			pending = null;
+			registerBtn.disabled = true;
+
+			return callRegisterBegin('root', 'required', window.location.origin).then(function(data) {
 				if (data.error) throw data;
+				if (closed) return;
 
 				var opts = data.publicKey || data;
 				if (opts.challenge)
@@ -230,14 +263,31 @@ return view.extend({
 					});
 				}
 
-				return navigator.credentials.create({ publicKey: opts }).then(function(cred) {
-					return { cred: cred, challengeId: data.challengeId };
-				});
-			})
-			.then(function(result) {
-				var cred = result.cred;
+				pending = { opts: opts, challengeId: data.challengeId };
+				refreshTimer = setTimeout(prepare, 4 * 60 * 1000);
+				registerBtn.disabled = false;
+				showStatus(_('Your browser will ask you to create a passkey.'), false);
+			}).catch(function(err) {
+				if (!closed)
+					showStatus(friendlyError(err), true);
+			});
+		};
+
+		var register = function() {
+			if (!pending)
+				return;
+
+			var deviceName = nameInput.value.trim() || _('My Device');
+			var challengeId = pending.challengeId;
+
+			registerBtn.disabled = true;
+			clearTimeout(refreshTimer);
+			showStatus(_('Waiting for passkey…'), false);
+
+			// Called synchronously from the click handler; see above.
+			navigator.credentials.create({ publicKey: pending.opts }).then(function(cred) {
 				return callRegisterFinish(
-					result.challengeId,
+					challengeId,
 					deviceName,
 					cred.id,
 					cred.type,
@@ -247,15 +297,43 @@ return view.extend({
 					},
 					window.location.origin
 				);
-			})
-			.then(function(data) {
+			}).then(function(data) {
 				if (data.error) throw data;
+				close();
 				ui.addNotification(null, E('p', _('Passkey registered successfully!')), 'info');
 				return self.refreshTable();
-			})
-			.catch(function(err) {
-				ui.addNotification(null, E('p', friendlyError(err)), 'error');
+			}).catch(function(err) {
+				if (closed) return;
+				var msg = (err && err.name === 'NotAllowedError')
+					? _('The browser did not create a passkey: the request was cancelled, timed out, or was blocked.')
+					: friendlyError(err);
+				// The challenge may be spent; get a new one for another try.
+				prepare().then(function() { if (!closed) showStatus(msg, true); });
 			});
+		};
+
+		registerBtn.addEventListener('click', register);
+		nameInput.addEventListener('keydown', function(ev) {
+			if (ev.key === 'Enter')
+				register();
+		});
+
+		ui.showModal(_('Register New Passkey'), [
+			E('div', { 'class': 'cbi-value' }, [
+				E('label', { 'class': 'cbi-value-title' }, _('Name')),
+				E('div', { 'class': 'cbi-value-field' }, [ nameInput ])
+			]),
+			statusEl,
+			E('div', { 'class': 'right' }, [
+				E('button', { 'class': 'btn cbi-button', 'click': close }, _('Cancel')),
+				' ',
+				registerBtn
+			])
+		]);
+
+		nameInput.focus();
+		nameInput.select();
+		prepare();
 	},
 
 	render: function(data) {
